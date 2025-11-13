@@ -1,0 +1,381 @@
+#include <iostream>
+#include <vector>
+#include <string>
+#include <sstream>
+#include <algorithm>
+#include <chrono>
+#include <climits>
+
+using namespace std;
+using Clock = chrono::steady_clock;
+using TimePoint = chrono::time_point<Clock>;
+
+// ----------------- 配置（根据文档） -----------------
+static const int BOARD_N = 12;       // 棋盘 12 x 12
+static const int EMPTY = 0;
+static const int BLACK = 1;
+static const int WHITE = 2;
+static const int WIN_COUNT = 5;
+
+const double PER_STEP_LIMIT = 2.0;   // 每步 2 秒（文档）
+const double TOTAL_LIMIT = 90.0;     // 每局总时间 90 秒（文档）
+const double SAFETY_MARGIN = 0.05;   // 小余量，防止超时
+
+// ----------------- 全局变量 -----------------
+int board[BOARD_N][BOARD_N];
+int myColor = BLACK;
+int oppColor = WHITE;
+bool inGame = false;
+double totalUsedTime = 0.0; // 我方已用总时间（秒）
+
+// 四个方向用于连子检测（水平、竖直、两对角）
+int dirX[4] = { 1, 0, 1, 1 };
+int dirY[4] = { 0, 1, 1, -1 };
+
+// 本次落子时间控制
+TimePoint moveStart;
+double perMoveTimeAllowed = 1.9; // 动态设置
+bool timeUp = false;
+
+// ----------------- 工具 -----------------
+inline bool onBoard(int r, int c) {
+    return r >= 0 && r < BOARD_N && c >= 0 && c < BOARD_N;
+}
+inline void flushStdout() { cout.flush(); }
+inline void safePrintOK() { cout << "OK\n"; flushStdout(); }
+
+// 计算当前 move 已耗时（秒）
+inline double elapsedSinceMoveStart() {
+    return chrono::duration<double>(Clock::now() - moveStart).count();
+}
+inline bool checkTimeOut() {
+    if (elapsedSinceMoveStart() >= perMoveTimeAllowed - 1e-9) {
+        timeUp = true;
+        return true;
+    }
+    return false;
+}
+
+// ----------------- 初始化初始布局（来自你提供的图片） -----------------
+// 中心 2x2 布局（0-based 行列）
+// (5,5) = WHITE, (5,6) = BLACK, (6,5) = BLACK, (6,6) = WHITE
+void initBoardWithImageLayout() {
+    for (int r = 0; r < BOARD_N; ++r)
+        for (int c = 0; c < BOARD_N; ++c)
+            board[r][c] = EMPTY;
+    // place the 2x2 block
+    board[5][5] = WHITE;
+    board[5][6] = BLACK;
+    board[6][5] = BLACK;
+    board[6][6] = WHITE;
+}
+
+// ----------------- 胜负检测 -----------------
+bool isWinAt(int r, int c, int color) {
+    for (int d = 0; d < 4; ++d) {
+        int cnt = 1;
+        int nr = r + dirX[d], nc = c + dirY[d];
+        while (onBoard(nr, nc) && board[nr][nc] == color) { cnt++; nr += dirX[d]; nc += dirY[d]; }
+        nr = r - dirX[d]; nc = c - dirY[d];
+        while (onBoard(nr, nc) && board[nr][nc] == color) { cnt++; nr -= dirX[d]; nc -= dirY[d]; }
+        if (cnt >= WIN_COUNT) return true;
+    }
+    return false;
+}
+
+// ----------------- 评估函数（启发式） -----------------
+int evalColor(int color) {
+    int score = 0;
+    for (int r = 0; r < BOARD_N; ++r) {
+        for (int c = 0; c < BOARD_N; ++c) {
+            if (board[r][c] != color) continue;
+            for (int d = 0; d < 4; ++d) {
+                int pr = r - dirX[d], pc = c - dirY[d];
+                if (onBoard(pr, pc) && board[pr][pc] == color) continue; // 非段首跳过
+                int len = 0;
+                int rr = r, cc = c;
+                while (onBoard(rr, cc) && board[rr][cc] == color) { len++; rr += dirX[d]; cc += dirY[d]; }
+                bool open1 = false, open2 = false;
+                int ar = r - dirX[d], ac = c - dirY[d];
+                if (onBoard(ar, ac) && board[ar][ac] == EMPTY) open1 = true;
+                if (onBoard(rr, cc) && board[rr][cc] == EMPTY) open2 = true;
+
+                if (len >= 5) score += 1000000;
+                else if (len == 4) {
+                    if (open1 && open2) score += 20000; // 活四
+                    else if (open1 || open2) score += 5000; // 冲四
+                }
+                else if (len == 3) {
+                    if (open1 && open2) score += 1200; // 活三
+                    else if (open1 || open2) score += 200; // 眠三
+                }
+                else if (len == 2) {
+                    if (open1 && open2) score += 120; // 活二
+                    else if (open1 || open2) score += 20;
+                }
+                else if (len == 1) {
+                    if (open1 && open2) score += 10;
+                }
+            }
+        }
+    }
+    return score;
+}
+int evaluateBoard() {
+    int myS = evalColor(myColor);
+    int oppS = evalColor(oppColor);
+    return myS - oppS;
+}
+
+// ----------------- 候选落点生成 -----------------
+vector<pair<int, int>> generateMoves(int radius = 2) {
+    vector<pair<int, int>> moves;
+    bool any = false;
+    for (int r = 0; r < BOARD_N && !any; ++r)
+        for (int c = 0; c < BOARD_N; ++c)
+            if (board[r][c] != EMPTY) { any = true; break; }
+    if (!any) {
+        moves.emplace_back(BOARD_N / 2, BOARD_N / 2);
+        return moves;
+    }
+    vector<vector<char>> mark(BOARD_N, vector<char>(BOARD_N, 0));
+    for (int r = 0; r < BOARD_N; ++r) {
+        for (int c = 0; c < BOARD_N; ++c) {
+            if (board[r][c] != EMPTY) {
+                for (int dr = -radius; dr <= radius; ++dr)
+                    for (int dc = -radius; dc <= radius; ++dc) {
+                        int nr = r + dr, nc = c + dc;
+                        if (onBoard(nr, nc) && board[nr][nc] == EMPTY) mark[nr][nc] = 1;
+                    }
+            }
+        }
+    }
+    for (int r = 0; r < BOARD_N; ++r)
+        for (int c = 0; c < BOARD_N; ++c)
+            if (mark[r][c]) moves.emplace_back(r, c);
+
+    // 简单排序：按距离中心优先，便于 alpha-beta 剪枝
+    int cr = BOARD_N / 2, cc = BOARD_N / 2;
+    sort(moves.begin(), moves.end(), [&](const pair<int, int>& a, const pair<int, int>& b) {
+        int da = (a.first - cr) * (a.first - cr) + (a.second - cc) * (a.second - cc);
+        int db = (b.first - cr) * (b.first - cr) + (b.second - cc) * (b.second - cc);
+        return da < db;
+        });
+    return moves;
+}
+
+// ----------------- Alpha-Beta 搜索 -----------------
+int alphaBeta(int depth, int alpha, int beta, int playerColor) {
+    if (checkTimeOut()) return evaluateBoard();
+    if (depth == 0) return evaluateBoard();
+
+    vector<pair<int, int>> moves = generateMoves();
+    if (moves.empty()) return evaluateBoard();
+
+    if (playerColor == myColor) {
+        int value = INT_MIN / 4;
+        for (auto& mv : moves) {
+            if (checkTimeOut()) break;
+            int r = mv.first, c = mv.second;
+            board[r][c] = playerColor;
+            int val;
+            if (isWinAt(r, c, playerColor)) val = 10000000;
+            else val = alphaBeta(depth - 1, alpha, beta, oppColor);
+            board[r][c] = EMPTY;
+            if (val > value) value = val;
+            if (value > alpha) alpha = value;
+            if (alpha >= beta) break;
+        }
+        return value;
+    }
+    else {
+        int value = INT_MAX / 4;
+        for (auto& mv : moves) {
+            if (checkTimeOut()) break;
+            int r = mv.first, c = mv.second;
+            board[r][c] = playerColor;
+            int val;
+            if (isWinAt(r, c, playerColor)) val = -10000000;
+            else val = alphaBeta(depth - 1, alpha, beta, myColor);
+            board[r][c] = EMPTY;
+            if (val < value) value = val;
+            if (value < beta) beta = value;
+            if (alpha >= beta) break;
+        }
+        return value;
+    }
+}
+
+// ----------------- 立即一阶检查（赢/堵） -----------------
+bool findImmediateWin(int color, pair<int, int>& outMove) {
+    vector<pair<int, int>> moves = generateMoves();
+    for (auto& mv : moves) {
+        int r = mv.first, c = mv.second;
+        if (board[r][c] != EMPTY) continue;
+        board[r][c] = color;
+        bool win = isWinAt(r, c, color);
+        board[r][c] = EMPTY;
+        if (win) {
+            outMove = mv;
+            return true;
+        }
+    }
+    return false;
+}
+
+// ----------------- 迭代加深与最佳走子选择 -----------------
+pair<int, int> findBestMove() {
+    vector<pair<int, int>> moves = generateMoves();
+    if (moves.empty()) return { BOARD_N / 2, BOARD_N / 2 };
+
+    // 1) 我方直接赢
+    pair<int, int> mv;
+    if (findImmediateWin(myColor, mv)) return mv;
+    // 2) 对手直接赢需要堵
+    if (findImmediateWin(oppColor, mv)) return mv;
+
+    pair<int, int> bestMove = moves[0];
+    int bestVal = INT_MIN / 4;
+    int MAX_DEPTH = 6;
+
+    for (int depth = 1; depth <= MAX_DEPTH; ++depth) {
+        if (checkTimeOut()) break;
+        int curBestVal = INT_MIN / 4;
+        pair<int, int> curBest = bestMove;
+
+        // 粗排序：用放子后 quick eval 排序，利于剪枝
+        vector<pair<int, int>> order;
+        order.reserve(moves.size());
+        vector<pair<int, int>> tmp;
+        for (auto& m : moves) {
+            int r = m.first, c = m.second;
+            if (board[r][c] != EMPTY) continue;
+            board[r][c] = myColor;
+            int sc = evaluateBoard();
+            board[r][c] = EMPTY;
+            tmp.emplace_back(-sc, (r << 8) | c);
+        }
+        sort(tmp.begin(), tmp.end());
+        for (auto& p : tmp) {
+            int code = p.second;
+            int r = (code >> 8) & 0xFF;
+            int c = code & 0xFF;
+            order.emplace_back(r, c);
+        }
+        if (order.empty()) order = moves;
+
+        for (auto& m : order) {
+            if (checkTimeOut()) break;
+            int r = m.first, c = m.second;
+            if (board[r][c] != EMPTY) continue;
+            board[r][c] = myColor;
+            int val;
+            if (isWinAt(r, c, myColor)) val = 10000000;
+            else val = alphaBeta(depth - 1, INT_MIN / 4, INT_MAX / 4, oppColor);
+            board[r][c] = EMPTY;
+            if (timeUp) break;
+            if (val > curBestVal) { curBestVal = val; curBest = m; }
+        }
+
+        if (!timeUp && curBestVal > bestVal) {
+            bestVal = curBestVal;
+            bestMove = curBest;
+        }
+        if (bestVal >= 9000000) break;
+    }
+
+    return bestMove;
+}
+
+// ----------------- 主循环：协议实现 -----------------
+int main() {
+    ios::sync_with_stdio(false);
+    cin.tie(nullptr);
+
+    // 初始化棋盘为图中给定初始布局
+    initBoardWithImageLayout();
+
+    string line;
+    while (std::getline(cin, line)) {
+        if (line.empty()) continue;
+        istringstream iss(line);
+        string cmd;
+        iss >> cmd;
+        if (cmd == "START") {
+            int field = 1;
+            if (iss >> field) {
+                if (field == 1) { myColor = BLACK; oppColor = WHITE; }
+                else { myColor = WHITE; oppColor = BLACK; }
+            }
+            else {
+                myColor = BLACK; oppColor = WHITE;
+            }
+            // 重置棋盘为图中初始布局（确保每局都从相同初始状态开始）
+            initBoardWithImageLayout();
+            inGame = true;
+            totalUsedTime = 0.0;
+            // 必须在1秒内回应 OK
+            safePrintOK();
+        }
+        else if (cmd == "PLACE") {
+            // PLACE X Y：对手走子（X,Y 均 0-based，代表 行 列）
+            int X, Y;
+            if (!(iss >> X >> Y)) continue;
+            if (onBoard(X, Y)) {
+                // 如果该位置已是初始棋子（平台可能不会重复发送初始布局），
+                // 覆盖/确认棋子颜色——按对手颜色记录
+                board[X][Y] = oppColor;
+            }
+        }
+        else if (cmd == "TURN") {
+            // 到我们走了
+            if (!inGame) {
+                initBoardWithImageLayout();
+                inGame = true;
+                myColor = BLACK; oppColor = WHITE;
+                totalUsedTime = 0.0;
+            }
+            // 计算允许时间：不能超过每步 2s，且不能让总时间超 90s
+            double remainingTotal = TOTAL_LIMIT - totalUsedTime;
+            if (remainingTotal < 0.0) remainingTotal = 0.0;
+            perMoveTimeAllowed = min(PER_STEP_LIMIT - SAFETY_MARGIN, remainingTotal - SAFETY_MARGIN);
+            if (perMoveTimeAllowed < 0.05) perMoveTimeAllowed = 0.05;
+            moveStart = Clock::now();
+            timeUp = false;
+
+            pair<int, int> best = findBestMove();
+
+            double used = elapsedSinceMoveStart();
+            totalUsedTime += used;
+
+            // 兜底：若选点非法或已被占，选第一个空位
+            if (!onBoard(best.first, best.second) || board[best.first][best.second] != EMPTY) {
+                bool found = false;
+                for (int r = 0; r < BOARD_N && !found; ++r)
+                    for (int c = 0; c < BOARD_N; ++c)
+                        if (board[r][c] == EMPTY) { best = { r,c }; found = true; break; }
+                if (!found) best = { 0,0 };
+            }
+
+            // 输出坐标（行 列），0-based，并立即 flush
+            cout << best.first << " " << best.second << "\n";
+            flushStdout();
+            // 更新棋盘
+            board[best.first][best.second] = myColor;
+        }
+        else if (cmd == "END") {
+            break;
+        }
+        else if (cmd == "DEBUG") {
+            string rest;
+            getline(iss, rest);
+            if (!rest.empty()) cerr << "DEBUG" << rest << endl;
+        }
+        else {
+            // 忽略未知命令
+            continue;
+        }
+    }
+
+    return 0;
+}
